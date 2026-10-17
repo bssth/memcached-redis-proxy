@@ -2,79 +2,66 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+
 	"github.com/bssth/go-memcached"
 	"github.com/redis/go-redis/v9"
-	"log"
-	"strconv"
-	"time"
 )
-
-type Cache struct {
-	client *redis.Client
-}
-
-func (c Cache) Get(key string) memcached.MemcachedResponse {
-	log.Println("Get", key)
-
-	val := c.client.Get(context.Background(), key)
-	if err := val.Err(); err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	item, err := val.Bytes()
-	if err != nil {
-		log.Println(err)
-		return nil
-	}
-
-	return &memcached.ItemResponse{
-		Item: &memcached.Item{
-			Key:   key,
-			Value: item,
-		},
-	}
-}
-
-func (c Cache) Set(item *memcached.Item) memcached.MemcachedResponse {
-	log.Println("Set", item.Key)
-	c.client.Set(context.Background(), item.Key, item.Value, time.Second*time.Duration(item.Ttl))
-	return nil
-}
-
-func (c Cache) Delete(key string) memcached.MemcachedResponse {
-	log.Println("Delete", key)
-	c.client.Del(context.Background(), key)
-	return nil
-}
 
 var (
 	port      = flag.Int("port", 11211, "Port to listen on")
 	redisAddr = flag.String("redis", "localhost:6379", "Redis server address")
 	redisPass = flag.String("redis-pass", "", "Redis password")
-	redisDb   = flag.Int("redis-db", 0, "Redis DB")
+	redisDB   = flag.Int("redis-db", 0, "Redis DB")
+	prefix    = flag.String("prefix", "", "Prefix added to every key in Redis")
+	verbose   = flag.Bool("verbose", false, "Log every command")
 )
 
 func main() {
 	flag.Parse()
 
-	cache := &Cache{}
-	cache.client = redis.NewClient(&redis.Options{
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client := redis.NewClient(&redis.Options{
 		Addr:     *redisAddr,
 		Password: *redisPass,
-		DB:       *redisDb,
+		DB:       *redisDB,
 	})
+	defer func() { _ = client.Close() }()
 
-	if status := cache.client.Ping(context.Background()); status.Err() != nil {
-		log.Fatalln("Cannot connect to Redis:", status.Err())
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Fatalln("Cannot connect to Redis:", err)
 	}
 	log.Println("Connected to Redis")
 
-	log.Println("Starting memcached proxy server on port", *port)
-	server := memcached.NewServer(":"+strconv.Itoa(*port), cache)
-	err := server.ListenAndServe()
+	listener, err := net.Listen("tcp", ":"+strconv.Itoa(*port))
 	if err != nil {
 		log.Fatalln(err)
+	}
+	log.Println("Starting memcached proxy server on port", *port)
+
+	cache := &Cache{client: client, prefix: *prefix, verbose: *verbose}
+	server := memcached.NewServer(listener.Addr().String(), cache)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+
+	select {
+	case err := <-serveErr:
+		log.Fatalln(err)
+	case <-ctx.Done():
+		log.Println("Shutting down")
+		_ = listener.Close()
+		if err := <-serveErr; err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Println(err)
+		}
 	}
 }
