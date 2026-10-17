@@ -44,23 +44,18 @@ The server stops cleanly on `SIGINT` / `SIGTERM`.
 
 ## Supported commands
 
-`get`, `gets` (without CAS), `set`, `delete`, `stats`, `quit`.
+`get` and `gets` with one or more keys (CAS is not supported, so `gets` replies like `get`),
+`set` and `delete` (both with `noreply`), `stats`, `version`, `quit`.
+
+Malformed commands get `CLIENT_ERROR`, values over 1 MB get `SERVER_ERROR object too large for cache`.
+If Redis fails, every command replies `SERVER_ERROR backend error`, so a failure never looks like a miss.
 
 ## How data is stored in Redis
 
 - An item with flags `0` is a plain Redis string. Data written by other Redis clients is readable as well.
 - An item with non-zero flags is a Redis hash with the fields `value` and `flags`.
   Many clients (PHP, Python, Java) use flags to mark serialized or compressed values, so they must survive a round trip.
-- Expiration is set with Redis TTL. An expiration time in the past removes the key, like in memcached.
-
-## Known limitations
-
-These come from the protocol parser in [bssth/go-memcached](https://github.com/bssth/go-memcached) and need to be fixed there:
-
-- A malformed `set` line (for example `set abcdefgh` or a negative length) crashes the whole process.
-- `get a b c` (multi-get) is treated as one key `"a b c"` and is always a miss.
-- A negative relative expiration (for example `-1`) is treated as "never expires" instead of "already expired".
-- If Redis fails, `get` replies with a miss and `delete` with `NOT_FOUND`, because the parser can't send `SERVER_ERROR` for them. `set` does reply `SERVER_ERROR`.
+- Expiration is set with Redis TTL. A negative expiration or a time in the past removes the key, like in memcached.
 
 ## Testing
 

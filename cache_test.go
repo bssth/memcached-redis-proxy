@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,8 +16,8 @@ import (
 )
 
 // startProxy runs the proxy in-process on a random port, backed by miniredis,
-// and returns a real memcached client connected to it.
-func startProxy(t *testing.T, prefix string) (*miniredis.Miniredis, *memcache.Client) {
+// and returns a real memcached client connected to it and the proxy address.
+func startProxy(t *testing.T, prefix string) (*miniredis.Miniredis, *memcache.Client, string) {
 	t.Helper()
 
 	backend := miniredis.RunT(t)
@@ -34,7 +36,7 @@ func startProxy(t *testing.T, prefix string) (*miniredis.Miniredis, *memcache.Cl
 	mc := memcache.New(listener.Addr().String())
 	mc.Timeout = 2 * time.Second
 
-	return backend, mc
+	return backend, mc, listener.Addr().String()
 }
 
 func mustGet(t *testing.T, mc *memcache.Client, key string) *memcache.Item {
@@ -58,7 +60,7 @@ func expectMiss(t *testing.T, mc *memcache.Client, key string) {
 
 func TestSetGetDelete(t *testing.T) {
 	t.Parallel()
-	_, mc := startProxy(t, "")
+	_, mc, _ := startProxy(t, "")
 
 	if err := mc.Set(&memcache.Item{Key: "foo", Value: []byte("bar")}); err != nil {
 		t.Fatal(err)
@@ -74,7 +76,7 @@ func TestSetGetDelete(t *testing.T) {
 
 func TestDeleteMissingKeyIsNotFound(t *testing.T) {
 	t.Parallel()
-	_, mc := startProxy(t, "")
+	_, mc, _ := startProxy(t, "")
 
 	if err := mc.Delete("nope"); !errors.Is(err, memcache.ErrCacheMiss) {
 		t.Fatalf("delete missing key = %v, want ErrCacheMiss (NOT_FOUND)", err)
@@ -83,7 +85,7 @@ func TestDeleteMissingKeyIsNotFound(t *testing.T) {
 
 func TestFlagsAreKept(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	value := []byte("bin\x00\r\nary\xff")
 	for _, flags := range []uint32{1, 42, 1<<32 - 1} {
@@ -103,7 +105,7 @@ func TestFlagsAreKept(t *testing.T) {
 
 func TestZeroFlagsStoredAsPlainString(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("v1"), Flags: 5}); err != nil {
 		t.Fatal(err)
@@ -124,7 +126,7 @@ func TestZeroFlagsStoredAsPlainString(t *testing.T) {
 
 func TestReadsPlainRedisStrings(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	// Written by an older version of the proxy or by another Redis client.
 	_ = backend.Set("legacy", "plain")
@@ -136,7 +138,7 @@ func TestReadsPlainRedisStrings(t *testing.T) {
 
 func TestOtherRedisTypesAreMisses(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	_, _ = backend.Push("list", "a")
 	backend.HSet("foreign-hash", "x", "y")
@@ -147,7 +149,7 @@ func TestOtherRedisTypesAreMisses(t *testing.T) {
 
 func TestExpiration(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	for _, flags := range []uint32{0, 9} {
 		if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("v"), Flags: flags, Expiration: 10}); err != nil {
@@ -163,7 +165,7 @@ func TestExpiration(t *testing.T) {
 
 func TestExpirationInThePastDeletesKey(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	_ = backend.Set("k", "old")
 
@@ -179,9 +181,71 @@ func TestExpirationInThePastDeletesKey(t *testing.T) {
 	}
 }
 
+func TestNegativeExpirationDeletesKey(t *testing.T) {
+	t.Parallel()
+	backend, mc, _ := startProxy(t, "")
+
+	_ = backend.Set("k", "old")
+
+	if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("new"), Expiration: -1}); err != nil {
+		t.Fatal(err)
+	}
+
+	expectMiss(t, mc, "k")
+	if backend.Exists("k") {
+		t.Fatal("key with a negative expiration is still in Redis")
+	}
+}
+
+func TestMultiGet(t *testing.T) {
+	t.Parallel()
+	_, mc, _ := startProxy(t, "")
+
+	_ = mc.Set(&memcache.Item{Key: "plain", Value: []byte("p")})
+	_ = mc.Set(&memcache.Item{Key: "flagged", Value: []byte("f"), Flags: 3})
+
+	items, err := mc.GetMulti([]string{"plain", "missing", "flagged"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2: %v", len(items), items)
+	}
+	if got := items["plain"]; got == nil || string(got.Value) != "p" || got.Flags != 0 {
+		t.Fatalf("plain = %+v", got)
+	}
+	if got := items["flagged"]; got == nil || string(got.Value) != "f" || got.Flags != 3 {
+		t.Fatalf("flagged = %+v", got)
+	}
+}
+
+func TestMalformedCommandDoesNotCrash(t *testing.T) {
+	t.Parallel()
+	_, mc, addr := startProxy(t, "")
+
+	// These lines used to panic and kill the whole proxy.
+	for _, line := range []string{"set abcdefgh", "set k 0 0 -5"} {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Write([]byte(line + "\r\n"))
+		reply, err := bufio.NewReader(conn).ReadString('\n')
+		_ = conn.Close()
+		if err != nil || !strings.HasPrefix(reply, "CLIENT_ERROR") {
+			t.Fatalf("%q: reply %q, %v; want CLIENT_ERROR", line, reply, err)
+		}
+	}
+
+	if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("still alive")}); err != nil {
+		t.Fatalf("proxy stopped working: %v", err)
+	}
+}
+
 func TestPrefix(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "mc:")
+	backend, mc, _ := startProxy(t, "mc:")
 
 	if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("v")}); err != nil {
 		t.Fatal(err)
@@ -196,16 +260,19 @@ func TestPrefix(t *testing.T) {
 
 func TestRedisErrors(t *testing.T) {
 	t.Parallel()
-	backend, mc := startProxy(t, "")
+	backend, mc, _ := startProxy(t, "")
 
 	backend.SetError("ERR simulated failure")
 
 	if err := mc.Set(&memcache.Item{Key: "k", Value: []byte("v")}); err == nil {
 		t.Fatal("set succeeded while Redis fails, want SERVER_ERROR")
 	}
-	expectMiss(t, mc, "k")
-	if err := mc.Delete("k"); !errors.Is(err, memcache.ErrCacheMiss) {
-		t.Fatalf("delete while Redis fails = %v, want NOT_FOUND", err)
+	// A Redis failure must not look like a miss or NOT_FOUND.
+	if _, err := mc.Get("k"); err == nil || errors.Is(err, memcache.ErrCacheMiss) {
+		t.Fatalf("get while Redis fails = %v, want SERVER_ERROR", err)
+	}
+	if err := mc.Delete("k"); err == nil || errors.Is(err, memcache.ErrCacheMiss) {
+		t.Fatalf("delete while Redis fails = %v, want SERVER_ERROR", err)
 	}
 
 	backend.SetError("")

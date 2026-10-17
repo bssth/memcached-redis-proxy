@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"strconv"
@@ -29,16 +28,7 @@ type Cache struct {
 	verbose bool
 }
 
-// serverError makes the memcached server reply "SERVER_ERROR <reason>".
-type serverError struct {
-	reason string
-}
-
-func (e *serverError) WriteResponse(w io.Writer) {
-	_, _ = fmt.Fprintf(w, "SERVER_ERROR %s\r\n", e.reason)
-}
-
-// notFound is any non-nil response: the memcached server then replies NOT_FOUND to delete.
+// notFound is a non-nil, non-error response: the memcached server then replies NOT_FOUND to delete.
 type notFound struct{}
 
 func (notFound) WriteResponse(io.Writer) {}
@@ -53,8 +43,7 @@ func (c *Cache) debugf(format string, args ...any) {
 	}
 }
 
-// Get returns nil for a miss. A Redis error is also reported as a miss,
-// because go-memcached always ends a get reply with END and cannot send an error instead.
+// Get returns nil for a miss and SERVER_ERROR when Redis fails.
 func (c *Cache) Get(key string) memcached.MemcachedResponse {
 	c.debugf("get %q", key)
 	ctx := context.Background()
@@ -68,18 +57,17 @@ func (c *Cache) Get(key string) memcached.MemcachedResponse {
 	case isWrongType(err):
 		return c.getWithFlags(ctx, key)
 	default:
-		log.Printf("get %q: %v", key, err)
-		return nil
+		return backendError("get", key, err)
 	}
 }
 
 func (c *Cache) getWithFlags(ctx context.Context, key string) memcached.MemcachedResponse {
 	fields, err := c.client.HMGet(ctx, c.key(key), fieldValue, fieldFlags).Result()
 	if err != nil {
-		if !errors.Is(err, redis.Nil) && !isWrongType(err) {
-			log.Printf("get %q: %v", key, err)
+		if errors.Is(err, redis.Nil) || isWrongType(err) {
+			return nil // gone in the meantime, or another Redis type
 		}
-		return nil
+		return backendError("get", key, err)
 	}
 
 	value, ok := fields[0].(string)
@@ -114,7 +102,7 @@ func (c *Cache) Set(item *memcached.Item) memcached.MemcachedResponse {
 	if expired {
 		// In memcached an item with an expiry in the past is stored and immediately gone.
 		if err := c.client.Del(ctx, key).Err(); err != nil {
-			return c.setFailed(item.Key, err)
+			return backendError("set", item.Key, err)
 		}
 		return nil
 	}
@@ -134,15 +122,16 @@ func (c *Cache) Set(item *memcached.Item) memcached.MemcachedResponse {
 		})
 	}
 	if err != nil {
-		return c.setFailed(item.Key, err)
+		return backendError("set", item.Key, err)
 	}
 
 	return nil
 }
 
-func (c *Cache) setFailed(key string, err error) memcached.MemcachedResponse {
-	log.Printf("set %q: %v", key, err)
-	return &serverError{reason: "backend error"}
+// backendError logs a Redis failure and makes the server reply "SERVER_ERROR backend error".
+func backendError(cmd, key string, err error) memcached.MemcachedResponse {
+	log.Printf("%s %q: %v", cmd, key, err)
+	return &memcached.ServerErrorResponse{Reason: "backend error"}
 }
 
 // expiration turns the item's memcached expiry into a Redis TTL.
@@ -160,15 +149,14 @@ func expiration(item *memcached.Item) (ttl time.Duration, expired bool) {
 	return ttl, false
 }
 
-// Delete returns nil when the key was deleted (DELETED) and non-nil otherwise (NOT_FOUND).
-// go-memcached can't send SERVER_ERROR for delete, so a Redis error is logged and reported as NOT_FOUND.
+// Delete returns nil when the key was deleted (DELETED), notFound when there was
+// no such key (NOT_FOUND) and SERVER_ERROR when Redis fails.
 func (c *Cache) Delete(key string) memcached.MemcachedResponse {
 	c.debugf("delete %q", key)
 
 	deleted, err := c.client.Del(context.Background(), c.key(key)).Result()
 	if err != nil {
-		log.Printf("delete %q: %v", key, err)
-		return notFound{}
+		return backendError("delete", key, err)
 	}
 	if deleted == 0 {
 		return notFound{}

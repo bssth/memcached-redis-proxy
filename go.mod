@@ -6,7 +6,7 @@ require github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
-	github.com/bssth/go-memcached v0.0.0-20240629150313-6351b3c57773
+	github.com/bssth/go-memcached v0.0.0-20261017114856-74c935b622a8
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
