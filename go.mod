@@ -1,15 +1,18 @@
 module github.com/bssth/memcached-redis-proxy
 
-go 1.22.4
+go 1.26.0
 
-require github.com/bradfitz/gomemcache v0.0.0-20230905024940-24af94b03874
+require github.com/bradfitz/gomemcache v0.0.0-20260422231931-4d751bb6e37c
 
 require (
-	github.com/bssth/go-memcached v0.0.0-20240629150313-6351b3c57773
-	github.com/redis/go-redis/v9 v9.5.3
+	github.com/alicebob/miniredis/v2 v2.40.0
+	github.com/bssth/go-memcached v0.0.0-20261017122505-8954dfc15773
+	github.com/redis/go-redis/v9 v9.23.0
 )
 
 require (
-	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
 )
